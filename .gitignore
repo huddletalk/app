@@ -137,3 +137,31 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# React Native / Android
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/.idea/
+android/*.iml
+android/.cxx/
+android/app/.cxx/
+.cxx/
+*.iml
+*.hprof
+*.keystore
+android/*.keystore
+!android/app/debug.keystore
+
+# React Native / iOS
+ios/build/
+ios/DerivedData/
+ios/Pods/
+ios/.symlinks/
+ios/Podfile.lock
+*.xcworkspace
+**/.xcode.env.local
+
+# Metro
+.metro-health-check*

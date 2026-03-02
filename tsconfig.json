@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "allowJs": false,
+    "jsx": "react-native",
+    "lib": ["ES2020"],
+    "moduleResolution": "Bundler",
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2020"
+  },
+  "include": ["App.tsx"],
+  "exclude": ["node_modules"]
+}
