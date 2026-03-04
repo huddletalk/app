@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "mediasoup-client": "^3.18.7",
     "react": "^19.1.0",
     "react-native": "^0.81.0",
     "react-native-webrtc": "^124.0.6"

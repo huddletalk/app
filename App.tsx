@@ -10,11 +10,23 @@ import {
   Text,
   View,
 } from "react-native";
+import { Device } from "mediasoup-client";
+import type {
+  Consumer,
+  DtlsParameters,
+  IceCandidate,
+  IceParameters,
+  MediaKind,
+  Producer,
+  RtpCapabilities,
+  RtpParameters,
+  SctpParameters,
+  Transport,
+} from "mediasoup-client/types";
 import {
-  RTCPeerConnection,
-  RTCIceCandidate,
-  RTCSessionDescription,
+  MediaStream,
   mediaDevices,
+  registerGlobals,
 } from "react-native-webrtc";
 
 type Room = {
@@ -22,22 +34,113 @@ type Room = {
   capacity: number;
 };
 
-type ServerSignal =
-  | { type: "joined"; peer_id: string; room_id: string }
-  | { type: "answer"; sdp: string }
-  | { type: "offer"; sdp: string }
-  | {
-      type: "ice_candidate";
-      candidate: string;
-      sdp_mid?: string;
-      sdp_mline_index?: number;
-    }
-  | { type: "peer_joined"; peer_id: string }
-  | { type: "peer_left"; peer_id: string }
-  | { type: "error"; message: string }
-  | { type: "pong" };
+type TransportDirection = "send" | "recv";
 
-type IceCandidateSignal = Extract<ServerSignal, { type: "ice_candidate" }>;
+type ClientSignal =
+  | { type: "join"; room_id: string }
+  | { type: "create_webrtc_transport"; direction: TransportDirection }
+  | {
+      type: "connect_webrtc_transport";
+      transport_id: string;
+      dtls_parameters: DtlsParameters;
+    }
+  | {
+      type: "produce";
+      transport_id: string;
+      kind: MediaKind;
+      rtp_parameters: RtpParameters;
+    }
+  | {
+      type: "consume";
+      transport_id: string;
+      producer_id: string;
+      rtp_capabilities: RtpCapabilities;
+    }
+  | { type: "resume_consumer"; consumer_id: string }
+  | { type: "ping" };
+
+type JoinedSignal = {
+  type: "joined";
+  peer_id: string;
+  room_id: string;
+  router_rtp_capabilities: RtpCapabilities;
+  existing_producer_ids: string[];
+};
+
+type WebrtcTransportCreatedSignal = {
+  type: "webrtc_transport_created";
+  direction: TransportDirection;
+  transport_id: string;
+  ice_parameters: IceParameters;
+  ice_candidates: IceCandidate[];
+  dtls_parameters: DtlsParameters;
+  sctp_parameters?: SctpParameters;
+};
+
+type TransportConnectedSignal = {
+  type: "transport_connected";
+  transport_id: string;
+};
+
+type ProducedSignal = {
+  type: "produced";
+  producer_id: string;
+};
+
+type NewProducerSignal = {
+  type: "new_producer";
+  peer_id: string;
+  producer_id: string;
+};
+
+type ConsumedSignal = {
+  type: "consumed";
+  consumer_id: string;
+  producer_id: string;
+  kind: MediaKind;
+  rtp_parameters: RtpParameters;
+};
+
+type ConsumerResumedSignal = {
+  type: "consumer_resumed";
+  consumer_id: string;
+};
+
+type PeerLeftSignal = {
+  type: "peer_left";
+  peer_id: string;
+};
+
+type ErrorSignal = {
+  type: "error";
+  message: string;
+};
+
+type PongSignal = {
+  type: "pong";
+};
+
+type ServerSignal =
+  | JoinedSignal
+  | WebrtcTransportCreatedSignal
+  | TransportConnectedSignal
+  | ProducedSignal
+  | NewProducerSignal
+  | ConsumedSignal
+  | ConsumerResumedSignal
+  | PeerLeftSignal
+  | ErrorSignal
+  | PongSignal;
+
+type ServerEnvelope = ServerSignal & {
+  request_id?: number;
+};
+
+type PendingRequest = {
+  resolve: (signal: ServerSignal) => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+};
 
 // Set this to your Mac's LAN IP for real phones on the same Wi-Fi.
 // Empty string = use local emulator/simulator defaults.
@@ -79,16 +182,22 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const deviceRef = useRef<Device | null>(null);
+  const sendTransportRef = useRef<Transport | null>(null);
+  const recvTransportRef = useRef<Transport | null>(null);
+  const producerRef = useRef<Producer | null>(null);
+  const consumersRef = useRef<Map<string, Consumer>>(new Map());
   const localStreamRef = useRef<any | null>(null);
-  const pendingIceCandidatesRef = useRef<IceCandidateSignal[]>([]);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
   const statsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastAudioBytesRef = useRef<{ bytes: number; timestampMs: number } | null>(
     null,
   );
-  const makingOfferRef = useRef(false);
-  const ignoreOfferRef = useRef(false);
-  const isSettingRemoteAnswerRef = useRef(false);
+  const globalsRegisteredRef = useRef(false);
+  const nextRequestIdRef = useRef(1);
+  const pendingRequestsRef = useRef<Map<number, PendingRequest>>(new Map());
+  const consumedProducerIdsRef = useRef<Set<string>>(new Set());
+  const queuedProducerIdsRef = useRef<Set<string>>(new Set());
 
   const stopAudioStatsLoop = useCallback(() => {
     if (statsIntervalRef.current) {
@@ -111,24 +220,45 @@ export default function App() {
     setMicEnabled(true);
   }, []);
 
+  const rejectAllPendingRequests = useCallback((reason: string) => {
+    for (const pending of pendingRequestsRef.current.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error(reason));
+    }
+    pendingRequestsRef.current.clear();
+  }, []);
+
   const disconnect = useCallback(() => {
+    rejectAllPendingRequests("signaling disconnected");
+
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
     }
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
-      peerConnectionRef.current = null;
+
+    producerRef.current?.close();
+    producerRef.current = null;
+
+    for (const consumer of consumersRef.current.values()) {
+      consumer.close();
     }
+    consumersRef.current.clear();
+
+    sendTransportRef.current?.close();
+    sendTransportRef.current = null;
+    recvTransportRef.current?.close();
+    recvTransportRef.current = null;
+
+    deviceRef.current = null;
+    remoteStreamRef.current = null;
+    consumedProducerIdsRef.current.clear();
+    queuedProducerIdsRef.current.clear();
+
     stopAudioStatsLoop();
     stopLocalStream();
-    pendingIceCandidatesRef.current = [];
-    makingOfferRef.current = false;
-    ignoreOfferRef.current = false;
-    isSettingRemoteAnswerRef.current = false;
     setActiveRoom(null);
     setConnectionState("new");
-  }, [stopAudioStatsLoop, stopLocalStream]);
+  }, [rejectAllPendingRequests, stopAudioStatsLoop, stopLocalStream]);
 
   const requestMicrophonePermission = useCallback(async (): Promise<boolean> => {
     if (Platform.OS !== "android") {
@@ -146,13 +276,13 @@ export default function App() {
   }, []);
 
   const startAudioStatsLoop = useCallback(
-    (peer: any) => {
+    (sendTransport: Transport) => {
       stopAudioStatsLoop();
       setAudioSendStatus("collecting audio stats...");
 
       statsIntervalRef.current = setInterval(async () => {
         try {
-          const rawStats = await peer.getStats();
+          const rawStats = await sendTransport.getStats();
           let reports: any[] = [];
 
           if (rawStats instanceof Map) {
@@ -225,33 +355,6 @@ export default function App() {
     setMicStatus(nextEnabled ? "capturing" : "muted");
   }, []);
 
-  const flushPendingIceCandidates = useCallback(async (peer: any) => {
-    if (!peer?.remoteDescription) {
-      return;
-    }
-
-    const queued = [...pendingIceCandidatesRef.current];
-    pendingIceCandidatesRef.current = [];
-
-    for (const signal of queued) {
-      const candidateInit: {
-        candidate: string;
-        sdpMid?: string | null;
-        sdpMLineIndex?: number | null;
-      } = {
-        candidate: signal.candidate,
-      };
-      if (signal.sdp_mid !== undefined) {
-        candidateInit.sdpMid = signal.sdp_mid;
-      }
-      if (signal.sdp_mline_index !== undefined) {
-        candidateInit.sdpMLineIndex = signal.sdp_mline_index;
-      }
-
-      await peer.addIceCandidate(new RTCIceCandidate(candidateInit));
-    }
-  }, []);
-
   const fetchRooms = useCallback(async () => {
     setLoading(true);
     setErrorMessage(null);
@@ -277,11 +380,191 @@ export default function App() {
     return disconnect;
   }, [disconnect, fetchRooms]);
 
-  const sendClientSignal = (payload: Record<string, unknown>) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(payload));
-    }
-  };
+  const sendRequest = useCallback(
+    <T extends ServerSignal>(signal: ClientSignal): Promise<T> => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error("signaling socket is not open"));
+      }
+
+      const requestId = nextRequestIdRef.current++;
+
+      return new Promise<T>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          pendingRequestsRef.current.delete(requestId);
+          reject(new Error(`request timed out for '${signal.type}'`));
+        }, 12_000);
+
+        pendingRequestsRef.current.set(requestId, {
+          resolve: resolve as (signal: ServerSignal) => void,
+          reject,
+          timeout,
+        });
+
+        ws.send(
+          JSON.stringify({
+            request_id: requestId,
+            ...signal,
+          }),
+        );
+      });
+    },
+    [],
+  );
+
+  const consumeProducer = useCallback(
+    async (producerId: string, roomId: string) => {
+      const device = deviceRef.current;
+      const recvTransport = recvTransportRef.current;
+
+      if (!device || !recvTransport) {
+        queuedProducerIdsRef.current.add(producerId);
+        return;
+      }
+
+      if (consumedProducerIdsRef.current.has(producerId)) {
+        return;
+      }
+      consumedProducerIdsRef.current.add(producerId);
+
+      try {
+        const consumed = await sendRequest<ConsumedSignal>({
+          type: "consume",
+          transport_id: recvTransport.id,
+          producer_id: producerId,
+          rtp_capabilities: device.rtpCapabilities,
+        });
+
+        const consumer = await recvTransport.consume({
+          id: consumed.consumer_id,
+          producerId: consumed.producer_id,
+          kind: consumed.kind,
+          rtpParameters: consumed.rtp_parameters,
+        });
+
+        consumersRef.current.set(consumer.id, consumer);
+
+        if (!remoteStreamRef.current) {
+          remoteStreamRef.current = new MediaStream();
+        }
+        remoteStreamRef.current.addTrack(consumer.track as any);
+
+        await sendRequest<ConsumerResumedSignal>({
+          type: "resume_consumer",
+          consumer_id: consumer.id,
+        });
+
+        setStatus(`receiving media in ${roomId}`);
+      } catch (error) {
+        consumedProducerIdsRef.current.delete(producerId);
+        const message = formatError(error, "failed to consume remote audio");
+        setErrorMessage(message);
+        setStatus("failed consuming remote audio");
+      }
+    },
+    [sendRequest],
+  );
+
+  const drainQueuedProducers = useCallback(
+    async (roomId: string) => {
+      const producerIds = [...queuedProducerIdsRef.current];
+      queuedProducerIdsRef.current.clear();
+
+      for (const producerId of producerIds) {
+        await consumeProducer(producerId, roomId);
+      }
+    },
+    [consumeProducer],
+  );
+
+  const createTransport = useCallback(
+    async (
+      device: Device,
+      direction: TransportDirection,
+      roomId: string,
+    ): Promise<Transport> => {
+      const created = await sendRequest<WebrtcTransportCreatedSignal>({
+        type: "create_webrtc_transport",
+        direction,
+      });
+
+      const transport: Transport =
+        direction === "send"
+          ? device.createSendTransport({
+              id: created.transport_id,
+              iceParameters: created.ice_parameters,
+              iceCandidates: created.ice_candidates,
+              dtlsParameters: created.dtls_parameters,
+              sctpParameters: created.sctp_parameters,
+            })
+          : device.createRecvTransport({
+              id: created.transport_id,
+              iceParameters: created.ice_parameters,
+              iceCandidates: created.ice_candidates,
+              dtlsParameters: created.dtls_parameters,
+              sctpParameters: created.sctp_parameters,
+            });
+
+      transport.on("connect", ({ dtlsParameters }, callback, errback) => {
+        void (async () => {
+          try {
+            await sendRequest<TransportConnectedSignal>({
+              type: "connect_webrtc_transport",
+              transport_id: created.transport_id,
+              dtls_parameters: dtlsParameters as DtlsParameters,
+            });
+            callback();
+          } catch (error) {
+            errback(error as Error);
+          }
+        })();
+      });
+
+      if (direction === "send") {
+        transport.on("produce", ({ kind, rtpParameters }, callback, errback) => {
+          void (async () => {
+            try {
+              const produced = await sendRequest<ProducedSignal>({
+                type: "produce",
+                transport_id: created.transport_id,
+                kind: kind as MediaKind,
+                rtp_parameters: rtpParameters as RtpParameters,
+              });
+              callback({ id: produced.producer_id });
+            } catch (error) {
+              errback(error as Error);
+            }
+          })();
+        });
+      }
+
+      transport.on("connectionstatechange", (state) => {
+        setConnectionState(state);
+        setStatus(`webrtc ${state} (${roomId}, ${direction})`);
+      });
+
+      return transport;
+    },
+    [sendRequest],
+  );
+
+  const handleServerEvent = useCallback(
+    (signal: ServerSignal, roomId: string) => {
+      if (signal.type === "new_producer") {
+        void consumeProducer(signal.producer_id, roomId);
+        return;
+      }
+      if (signal.type === "peer_left") {
+        setStatus(`peer ${signal.peer_id} left ${roomId}`);
+        return;
+      }
+      if (signal.type === "error") {
+        setErrorMessage(signal.message);
+        setStatus("server rejected signaling message");
+      }
+    },
+    [consumeProducer],
+  );
 
   const joinRoom = useCallback(
     async (roomId: string) => {
@@ -295,39 +578,58 @@ export default function App() {
       const ws = new WebSocket(SIGNAL_URL);
       wsRef.current = ws;
 
+      ws.onmessage = (event) => {
+        if (typeof event.data !== "string") {
+          return;
+        }
+
+        let envelope: ServerEnvelope;
+        try {
+          envelope = JSON.parse(event.data) as ServerEnvelope;
+        } catch (error) {
+          const message = formatError(error, "failed to parse signal payload");
+          setErrorMessage(message);
+          return;
+        }
+
+        const requestId = envelope.request_id;
+        if (typeof requestId === "number") {
+          const pending = pendingRequestsRef.current.get(requestId);
+          if (!pending) {
+            return;
+          }
+
+          pendingRequestsRef.current.delete(requestId);
+          clearTimeout(pending.timeout);
+
+          if (envelope.type === "error") {
+            pending.reject(new Error(envelope.message));
+          } else {
+            pending.resolve(envelope);
+          }
+          return;
+        }
+
+        handleServerEvent(envelope, roomId);
+      };
+
+      ws.onerror = () => {
+        setStatus("websocket error");
+      };
+
+      ws.onclose = () => {
+        if (wsRef.current === ws) {
+          disconnect();
+          setStatus("disconnected");
+        }
+      };
+
       ws.onopen = async () => {
         try {
           const micAllowed = await requestMicrophonePermission();
           if (!micAllowed) {
             throw new Error("microphone permission denied");
           }
-
-          const peer: any = new RTCPeerConnection({
-            iceServers: [],
-          });
-          peerConnectionRef.current = peer;
-
-          peer.onicecandidate = (event: any) => {
-            if (!event.candidate) {
-              return;
-            }
-            sendClientSignal({
-              type: "ice_candidate",
-              candidate: event.candidate.candidate,
-              sdp_mid: event.candidate.sdpMid ?? undefined,
-              sdp_mline_index: event.candidate.sdpMLineIndex ?? undefined,
-            });
-          };
-
-          peer.ontrack = () => {
-            setStatus(`receiving media in ${roomId}`);
-          };
-
-          peer.onconnectionstatechange = () => {
-            const state = peer.connectionState;
-            setConnectionState(state);
-            setStatus(`webrtc ${state}`);
-          };
 
           const stream = await mediaDevices.getUserMedia({
             audio: true,
@@ -342,13 +644,50 @@ export default function App() {
           setMicEnabled(audioTracks.every((track: any) => track.enabled !== false));
           setMicStatus("capturing");
 
-          for (const track of audioTracks) {
-            peer.addTrack(track, stream);
+          if (!globalsRegisteredRef.current) {
+            registerGlobals();
+            globalsRegisteredRef.current = true;
           }
 
-          startAudioStatsLoop(peer);
+          const device = new Device({ handlerName: "ReactNative106" });
+          deviceRef.current = device;
 
-          sendClientSignal({ type: "join", room_id: roomId });
+          const joined = await sendRequest<JoinedSignal>({
+            type: "join",
+            room_id: roomId,
+          });
+
+          await device.load({
+            routerRtpCapabilities: joined.router_rtp_capabilities,
+          });
+
+          const sendTransport = await createTransport(device, "send", roomId);
+          const recvTransport = await createTransport(device, "recv", roomId);
+
+          sendTransportRef.current = sendTransport;
+          recvTransportRef.current = recvTransport;
+
+          setActiveRoom(joined.room_id);
+          setStatus(`joined ${joined.room_id}`);
+
+          startAudioStatsLoop(sendTransport);
+
+          if (!device.canProduce("audio")) {
+            throw new Error("this device cannot produce audio");
+          }
+
+          const producer = await sendTransport.produce({
+            track: audioTracks[0],
+          });
+          producerRef.current = producer as Producer;
+
+          setStatus(`sending audio in ${joined.room_id}`);
+
+          for (const producerId of joined.existing_producer_ids) {
+            await consumeProducer(producerId, joined.room_id);
+          }
+
+          await drainQueuedProducers(joined.room_id);
         } catch (error) {
           const message = formatError(error, "unknown connect error");
           setErrorMessage(message);
@@ -356,133 +695,15 @@ export default function App() {
           disconnect();
         }
       };
-
-      ws.onmessage = async (event) => {
-        const peer = peerConnectionRef.current;
-        if (!peer || typeof event.data !== "string") {
-          return;
-        }
-
-        let signal: ServerSignal;
-        try {
-          signal = JSON.parse(event.data) as ServerSignal;
-        } catch (error) {
-          const message = formatError(error, "failed to parse signal");
-          setErrorMessage(message);
-          return;
-        }
-
-        try {
-          if (signal.type === "joined") {
-            setActiveRoom(signal.room_id);
-            setStatus(`joined ${signal.room_id}`);
-
-            makingOfferRef.current = true;
-            try {
-              const offer = await peer.createOffer();
-              await peer.setLocalDescription(offer);
-              sendClientSignal({
-                type: "offer",
-                sdp: offer.sdp ?? "",
-              });
-            } finally {
-              makingOfferRef.current = false;
-            }
-            return;
-          }
-          if (signal.type === "answer") {
-            isSettingRemoteAnswerRef.current = true;
-            try {
-              await peer.setRemoteDescription(
-                new RTCSessionDescription({ type: "answer", sdp: signal.sdp }),
-              );
-              await flushPendingIceCandidates(peer);
-            } finally {
-              isSettingRemoteAnswerRef.current = false;
-            }
-            return;
-          }
-          if (signal.type === "offer") {
-            const offerCollision =
-              makingOfferRef.current ||
-              (peer.signalingState && peer.signalingState !== "stable");
-            ignoreOfferRef.current = offerCollision;
-            if (ignoreOfferRef.current) {
-              return;
-            }
-
-            await peer.setRemoteDescription(
-              new RTCSessionDescription({ type: "offer", sdp: signal.sdp }),
-            );
-            await flushPendingIceCandidates(peer);
-            const answer = await peer.createAnswer();
-            await peer.setLocalDescription(answer);
-            sendClientSignal({ type: "answer", sdp: answer.sdp ?? "" });
-            return;
-          }
-          if (signal.type === "ice_candidate") {
-            if (!signal.candidate || ignoreOfferRef.current) {
-              return;
-            }
-
-            const hasRemoteDescription = Boolean(peer.remoteDescription);
-            if (!hasRemoteDescription) {
-              pendingIceCandidatesRef.current.push(signal);
-              return;
-            }
-
-            const candidateInit: {
-              candidate: string;
-              sdpMid?: string | null;
-              sdpMLineIndex?: number | null;
-            } = {
-              candidate: signal.candidate,
-            };
-            if (signal.sdp_mid !== undefined) {
-              candidateInit.sdpMid = signal.sdp_mid;
-            }
-            if (signal.sdp_mline_index !== undefined) {
-              candidateInit.sdpMLineIndex = signal.sdp_mline_index;
-            }
-
-            await peer.addIceCandidate(new RTCIceCandidate(candidateInit));
-            return;
-          }
-          if (signal.type === "peer_joined") {
-            setStatus(`peer ${signal.peer_id} joined ${roomId}`);
-            return;
-          }
-          if (signal.type === "peer_left") {
-            setStatus(`peer ${signal.peer_id} left ${roomId}`);
-            return;
-          }
-          if (signal.type === "error") {
-            setErrorMessage(signal.message);
-            setStatus("server rejected signaling message");
-            return;
-          }
-          if (signal.type === "pong") {
-            return;
-          }
-        } catch (error) {
-          const message = formatError(error, "webrtc update failed");
-          setErrorMessage(message);
-          setStatus("webrtc signaling failed");
-        }
-      };
-
-      ws.onerror = () => {
-        setStatus("websocket error");
-      };
-
-      ws.onclose = () => {
-        setStatus("disconnected");
-      };
     },
     [
+      consumeProducer,
+      createTransport,
       disconnect,
-      flushPendingIceCandidates,
+      drainQueuedProducers,
+      handleServerEvent,
       requestMicrophonePermission,
+      sendRequest,
       startAudioStatsLoop,
     ],
   );
